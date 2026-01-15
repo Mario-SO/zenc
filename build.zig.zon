@@ -1,0 +1,13 @@
+.{
+    .name = .zenc,
+    .version = "0.0.0",
+    .fingerprint = 0x441fe0e4553d48e5, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
