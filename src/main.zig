@@ -25,7 +25,7 @@ var g_total_size: u64 = 0;
 var g_last_progress_percent: u64 = 0;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
