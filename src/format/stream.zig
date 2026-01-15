@@ -22,12 +22,14 @@ pub const ProgressCallback = *const fn (bytes_processed: u64, total_bytes: u64) 
 
 /// Encrypt a file stream in chunks
 /// Returns the SHA-256 hash of the original plaintext
+/// header_bytes: serialized header to bind into AEAD associated data for authentication
 pub fn encryptStream(
     input_file: std.fs.File,
     output_file: std.fs.File,
     key: [aead.key_len]u8,
     base_nonce: [aead.nonce_len]u8,
     total_size: u64,
+    header_bytes: []const u8,
     progress_callback: ?ProgressCallback,
 ) ![Sha256.digest_length]u8 {
     var plaintext_buf: [default_chunk_size]u8 = undefined;
@@ -49,10 +51,14 @@ pub fn encryptStream(
         // Derive chunk nonce from base nonce and chunk index
         const chunk_nonce = deriveChunkNonce(base_nonce, chunk_index);
 
+        // Build associated data: header || chunk_index (little-endian)
+        // This binds the header and chunk order to the ciphertext
+        const ad = buildAssociatedData(header_bytes, chunk_index);
+
         // Encrypt chunk
         const tag = aead.encrypt(
             plaintext,
-            &.{}, // No additional data per chunk
+            &ad,
             chunk_nonce,
             key,
             ciphertext_buf[0..bytes_read],
@@ -82,12 +88,14 @@ pub fn encryptStream(
 
 /// Decrypt a file stream in chunks
 /// Returns the SHA-256 hash of the decrypted plaintext
+/// header_bytes: serialized header to verify AEAD associated data
 pub fn decryptStream(
     input_file: std.fs.File,
     output_file: std.fs.File,
     key: [aead.key_len]u8,
     base_nonce: [aead.nonce_len]u8,
     encrypted_size: u64,
+    header_bytes: []const u8,
     progress_callback: ?ProgressCallback,
 ) ![Sha256.digest_length]u8 {
     // Buffer for ciphertext chunk + tag
@@ -110,6 +118,12 @@ pub fn decryptStream(
     while (chunks_remaining > 0) {
         // Determine this chunk's ciphertext size
         const is_last_chunk = chunks_remaining == 1;
+
+        // Validate remaining size can hold at least the tag
+        if (is_last_chunk and remaining > 0 and remaining <= aead.tag_len) {
+            return error.InvalidEncryptedSize;
+        }
+
         const ciphertext_size = if (is_last_chunk and remaining > 0)
             remaining - aead.tag_len
         else
@@ -130,10 +144,13 @@ pub fn decryptStream(
         // Derive chunk nonce
         const chunk_nonce = deriveChunkNonce(base_nonce, chunk_index);
 
+        // Build associated data: header || chunk_index (little-endian)
+        const ad = buildAssociatedData(header_bytes, chunk_index);
+
         // Decrypt and verify
         aead.decrypt(
             ciphertext_buf[0..ciphertext_size],
-            &.{},
+            &ad,
             tag_buf,
             chunk_nonce,
             key,
@@ -175,6 +192,30 @@ fn deriveChunkNonce(base_nonce: [aead.nonce_len]u8, chunk_index: u64) [aead.nonc
         nonce[aead.nonce_len - 8 + i] ^= index_bytes[i];
     }
     return nonce;
+}
+
+/// Maximum header size we support for associated data
+pub const max_header_size: usize = 256;
+
+/// Size of the associated data buffer: header (up to max_header_size) + 8 bytes for chunk index
+pub const max_ad_size: usize = max_header_size + 8;
+
+/// Build associated data from header bytes and chunk index.
+/// This binds the header and chunk ordering to the AEAD authentication,
+/// preventing header tampering, chunk reordering, and truncation attacks.
+fn buildAssociatedData(header_bytes: []const u8, chunk_index: u64) [max_ad_size]u8 {
+    var ad: [max_ad_size]u8 = undefined;
+    @memset(&ad, 0);
+
+    // Copy header bytes (up to max_header_size)
+    const header_len = @min(header_bytes.len, max_header_size);
+    @memcpy(ad[0..header_len], header_bytes[0..header_len]);
+
+    // Append chunk index as little-endian u64 at fixed offset
+    const index_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, chunk_index));
+    @memcpy(ad[max_header_size..][0..8], &index_bytes);
+
+    return ad;
 }
 
 /// Calculate encrypted size from plaintext size

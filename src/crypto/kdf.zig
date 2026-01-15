@@ -41,6 +41,37 @@ pub const KdfParams = struct {
 /// Default KDF parameters (64MB, 3 iterations, 4 parallelism)
 pub const default_params = KdfParams{};
 
+/// Maximum allowed KDF parameters to prevent DoS attacks
+/// These limits are generous but prevent absurd values from malicious headers
+pub const max_memory_kib: u32 = 1024 * 1024; // 1GB max memory
+pub const max_iterations: u32 = 100; // 100 iterations max
+pub const max_parallelism: u24 = 64; // 64 threads max
+pub const min_memory_kib: u32 = 8; // At least 8KB (Argon2 minimum)
+pub const min_iterations: u32 = 1; // At least 1 iteration
+
+/// Validate KDF parameters are within safe bounds
+/// Returns error if parameters would cause DoS or are invalid
+pub fn validateParams(params: KdfParams) !void {
+    if (params.memory_kib < min_memory_kib) {
+        return error.KdfMemoryTooLow;
+    }
+    if (params.memory_kib > max_memory_kib) {
+        return error.KdfMemoryTooHigh;
+    }
+    if (params.iterations < min_iterations) {
+        return error.KdfIterationsTooLow;
+    }
+    if (params.iterations > max_iterations) {
+        return error.KdfIterationsTooHigh;
+    }
+    if (params.parallelism == 0) {
+        return error.KdfParallelismTooLow;
+    }
+    if (params.parallelism > max_parallelism) {
+        return error.KdfParallelismTooHigh;
+    }
+}
+
 /// Salt size in bytes
 pub const salt_len = 16;
 
@@ -145,4 +176,44 @@ test "params serialization round trip" {
     try std.testing.expectEqual(params.memory_kib, deserialized.memory_kib);
     try std.testing.expectEqual(params.iterations, deserialized.iterations);
     try std.testing.expectEqual(params.parallelism, deserialized.parallelism);
+}
+
+test "validate params accepts default" {
+    try validateParams(default_params);
+}
+
+test "validate params rejects excessive memory" {
+    const bad_params = KdfParams{
+        .memory_kib = max_memory_kib + 1,
+        .iterations = 1,
+        .parallelism = 1,
+    };
+    try std.testing.expectError(error.KdfMemoryTooHigh, validateParams(bad_params));
+}
+
+test "validate params rejects excessive iterations" {
+    const bad_params = KdfParams{
+        .memory_kib = 1024,
+        .iterations = max_iterations + 1,
+        .parallelism = 1,
+    };
+    try std.testing.expectError(error.KdfIterationsTooHigh, validateParams(bad_params));
+}
+
+test "validate params rejects zero parallelism" {
+    const bad_params = KdfParams{
+        .memory_kib = 1024,
+        .iterations = 1,
+        .parallelism = 0,
+    };
+    try std.testing.expectError(error.KdfParallelismTooLow, validateParams(bad_params));
+}
+
+test "validate params rejects too low memory" {
+    const bad_params = KdfParams{
+        .memory_kib = min_memory_kib - 1,
+        .iterations = 1,
+        .parallelism = 1,
+    };
+    try std.testing.expectError(error.KdfMemoryTooLow, validateParams(bad_params));
 }

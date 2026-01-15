@@ -18,8 +18,6 @@ const stream = zenc.stream;
 const memory = zenc.memory;
 const json = zenc.json;
 
-const Sha256 = std.crypto.hash.sha2.Sha256;
-
 /// Global state for progress reporting
 var g_total_size: u64 = 0;
 var g_last_progress_percent: u64 = 0;
@@ -74,6 +72,61 @@ fn cmdKeygen() !void {
     memory.secureZero(&sec_b64);
 }
 
+/// Maximum password/key size we accept from stdin
+const max_stdin_size = 4096;
+
+/// Result from reading stdin
+const StdinResult = struct {
+    data: []u8,
+    buffer: *[max_stdin_size]u8,
+
+    /// Securely wipe and release the buffer
+    pub fn wipe(self: *StdinResult) void {
+        memory.secureZero(self.buffer);
+    }
+};
+
+/// Read a line from stdin, trimming trailing newlines.
+/// Returns error if input is empty (after trimming) or exceeds max_stdin_size.
+/// Caller must call wipe() on result when done.
+fn readStdinLine(buffer: *[max_stdin_size]u8, require_non_empty: bool) !StdinResult {
+    const stdin = std.fs.File.stdin();
+
+    // Read from stdin
+    const bytes_read = stdin.read(buffer) catch |err| {
+        try json.emitError("stdin_error", @errorName(err));
+        std.process.exit(1);
+    };
+
+    // Check for overflow - if we filled the buffer, there might be more data
+    if (bytes_read == max_stdin_size) {
+        // Try to read one more byte to detect overflow
+        var overflow_check: [1]u8 = undefined;
+        const extra = stdin.read(&overflow_check) catch 0;
+        if (extra > 0) {
+            try json.emitError("input_too_long", "Input exceeds maximum allowed size");
+            std.process.exit(1);
+        }
+    }
+
+    // Trim trailing newlines/carriage returns
+    var data = buffer[0..bytes_read];
+    while (data.len > 0 and (data[data.len - 1] == '\n' or data[data.len - 1] == '\r')) {
+        data = data[0 .. data.len - 1];
+    }
+
+    // Check for empty input
+    if (require_non_empty and data.len == 0) {
+        try json.emitError("empty_input", "Input cannot be empty");
+        std.process.exit(1);
+    }
+
+    return StdinResult{
+        .data = data,
+        .buffer = buffer,
+    };
+}
+
 /// Encrypt a file
 fn cmdEncrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
@@ -126,40 +179,26 @@ fn cmdEncrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     g_total_size = file_size;
     g_last_progress_percent = 0;
 
+    // Hash of the original plaintext (returned by encrypt functions)
+    var hash: [zenc.hash_len]u8 = undefined;
+
     if (password_mode) {
-        // Read password from stdin
-        const stdin = std.fs.File.stdin();
-        var password_buf: [1024]u8 = undefined;
-        const password_len = stdin.read(&password_buf) catch |err| {
-            try json.emitError("stdin_error", @errorName(err));
-            std.process.exit(1);
-        };
+        // Read password from stdin (require non-empty)
+        var password_buf: [max_stdin_size]u8 = undefined;
+        var stdin_result = try readStdinLine(&password_buf, true);
+        defer stdin_result.wipe();
 
-        if (password_len == 0) {
-            try json.emitError("empty_password", "Password cannot be empty");
-            std.process.exit(1);
-        }
-
-        // Trim trailing newline
-        var password = password_buf[0..password_len];
-        while (password.len > 0 and (password[password.len - 1] == '\n' or password[password.len - 1] == '\r')) {
-            password = password[0 .. password.len - 1];
-        }
-
-        zenc.encryptFileWithPassword(
+        hash = zenc.encryptFileWithPassword(
             allocator,
             input_path,
             output_path,
-            password,
+            stdin_result.data,
             kdf.default_params,
             progressCallback,
         ) catch |err| {
-            memory.secureZero(&password_buf);
             try json.emitError("encrypt_error", @errorName(err));
             std.process.exit(1);
         };
-
-        memory.secureZero(&password_buf);
     } else {
         // Decode recipient public key
         var pubkey_bytes: [keys.ed25519_public_key_len]u8 = undefined;
@@ -168,7 +207,7 @@ fn cmdEncrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
             std.process.exit(1);
         };
 
-        zenc.encryptFileWithPubkey(
+        hash = zenc.encryptFileWithPubkey(
             allocator,
             input_path,
             output_path,
@@ -180,12 +219,6 @@ fn cmdEncrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
             std.process.exit(1);
         };
     }
-
-    // Compute hash of encrypted file
-    const hash = computeFileHash(output_path) catch |err| {
-        try json.emitError("hash_error", @errorName(err));
-        std.process.exit(1);
-    };
 
     const hash_hex = std.fmt.bytesToHex(hash, .lower);
 
@@ -252,70 +285,41 @@ fn cmdDecrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     g_total_size = file_size;
     g_last_progress_percent = 0;
 
+    // Hash of the decrypted plaintext (returned by decrypt function)
+    var hash: [zenc.hash_len]u8 = undefined;
+
     switch (mode) {
         .password => {
-            // Read password from stdin
-            const stdin = std.fs.File.stdin();
-            var password_buf: [1024]u8 = undefined;
-            const password_len = stdin.read(&password_buf) catch |err| {
-                try json.emitError("stdin_error", @errorName(err));
-                std.process.exit(1);
-            };
+            // Read password from stdin (require non-empty for consistency with encrypt)
+            var password_buf: [max_stdin_size]u8 = undefined;
+            var stdin_result = try readStdinLine(&password_buf, true);
+            defer stdin_result.wipe();
 
-            // Trim trailing newline
-            var password = password_buf[0..password_len];
-            while (password.len > 0 and (password[password.len - 1] == '\n' or password[password.len - 1] == '\r')) {
-                password = password[0 .. password.len - 1];
-            }
-
-            zenc.decryptFile(allocator, input_path, output_path, password, null, progressCallback) catch |err| {
-                memory.secureZero(&password_buf);
+            hash = zenc.decryptFile(allocator, input_path, output_path, stdin_result.data, null, progressCallback) catch |err| {
                 try json.emitError("decrypt_error", @errorName(err));
                 std.process.exit(1);
             };
-
-            memory.secureZero(&password_buf);
         },
         .pubkey => {
-            // Read secret key from stdin (base64 encoded)
-            const stdin = std.fs.File.stdin();
-            var key_buf: [1024]u8 = undefined;
-            const key_len = stdin.read(&key_buf) catch |err| {
-                try json.emitError("stdin_error", @errorName(err));
-                std.process.exit(1);
-            };
-
-            // Trim trailing newline
-            var key_b64 = key_buf[0..key_len];
-            while (key_b64.len > 0 and (key_b64[key_b64.len - 1] == '\n' or key_b64[key_b64.len - 1] == '\r')) {
-                key_b64 = key_b64[0 .. key_b64.len - 1];
-            }
+            // Read secret key from stdin (base64 encoded, require non-empty)
+            var key_buf: [max_stdin_size]u8 = undefined;
+            var stdin_result = try readStdinLine(&key_buf, true);
+            defer stdin_result.wipe();
 
             // Decode secret key
             var secret_key: [keys.ed25519_secret_key_len]u8 = undefined;
-            _ = keys.decodeBase64(key_b64, &secret_key) catch |err| {
-                memory.secureZero(&key_buf);
+            _ = keys.decodeBase64(stdin_result.data, &secret_key) catch |err| {
                 try json.emitError("invalid_key", @errorName(err));
                 std.process.exit(1);
             };
+            defer memory.secureZero(&secret_key);
 
-            zenc.decryptFile(allocator, input_path, output_path, null, secret_key, progressCallback) catch |err| {
-                memory.secureZero(&key_buf);
-                memory.secureZero(&secret_key);
+            hash = zenc.decryptFile(allocator, input_path, output_path, null, secret_key, progressCallback) catch |err| {
                 try json.emitError("decrypt_error", @errorName(err));
                 std.process.exit(1);
             };
-
-            memory.secureZero(&key_buf);
-            memory.secureZero(&secret_key);
         },
     }
-
-    // Compute hash of decrypted file
-    const hash = computeFileHash(output_path) catch |err| {
-        try json.emitError("hash_error", @errorName(err));
-        std.process.exit(1);
-    };
 
     const hash_hex = std.fmt.bytesToHex(hash, .lower);
 
@@ -325,10 +329,18 @@ fn cmdDecrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
 /// Progress callback for streaming operations
 fn progressCallback(bytes_processed: u64, total_bytes: u64) void {
     _ = total_bytes;
-    const percent: u64 = if (g_total_size > 0)
-        (bytes_processed * 100) / g_total_size
-    else
-        100;
+
+    // Handle zero-size files to avoid division by zero
+    if (g_total_size == 0) {
+        // For empty files, emit 100% immediately on first call
+        if (g_last_progress_percent == 0) {
+            g_last_progress_percent = 100;
+            json.emitProgress(0, 100.0) catch {};
+        }
+        return;
+    }
+
+    const percent: u64 = (bytes_processed * 100) / g_total_size;
 
     // Only emit progress every 5%
     if (percent >= g_last_progress_percent + 5 or percent == 100) {
@@ -336,23 +348,6 @@ fn progressCallback(bytes_processed: u64, total_bytes: u64) void {
         const percent_f: f64 = @as(f64, @floatFromInt(bytes_processed)) / @as(f64, @floatFromInt(g_total_size)) * 100.0;
         json.emitProgress(bytes_processed, percent_f) catch {};
     }
-}
-
-/// Compute SHA-256 hash of a file
-fn computeFileHash(path: []const u8) ![Sha256.digest_length]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    var hasher = Sha256.init(.{});
-    var buf: [8192]u8 = undefined;
-
-    while (true) {
-        const bytes_read = try file.read(&buf);
-        if (bytes_read == 0) break;
-        hasher.update(buf[0..bytes_read]);
-    }
-
-    return hasher.finalResult();
 }
 
 // Tests
