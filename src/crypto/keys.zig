@@ -10,7 +10,7 @@ const memory = @import("../utils/memory.zig");
 
 /// Ed25519 public key size in bytes
 pub const ed25519_public_key_len = Ed25519.PublicKey.encoded_length;
-/// Ed25519 secret key size in bytes  
+/// Ed25519 secret key size in bytes
 pub const ed25519_secret_key_len = Ed25519.SecretKey.encoded_length;
 /// X25519 public key size in bytes
 pub const x25519_public_key_len = X25519.public_length;
@@ -40,8 +40,8 @@ pub const X25519KeyPair = struct {
 };
 
 /// Generate a new Ed25519 keypair using the system's cryptographic RNG
-pub fn generateEd25519KeyPair() Ed25519KeyPair {
-    const kp = Ed25519.KeyPair.generate();
+pub fn generateEd25519KeyPair(io: std.Io) Ed25519KeyPair {
+    const kp = Ed25519.KeyPair.generate(io);
     return Ed25519KeyPair{
         .public_key = kp.public_key.toBytes(),
         .secret_key = kp.secret_key.toBytes(),
@@ -49,8 +49,8 @@ pub fn generateEd25519KeyPair() Ed25519KeyPair {
 }
 
 /// Generate a new X25519 keypair using the system's cryptographic RNG
-pub fn generateX25519KeyPair() X25519KeyPair {
-    const kp = X25519.KeyPair.generate();
+pub fn generateX25519KeyPair(io: std.Io) X25519KeyPair {
+    const kp = X25519.KeyPair.generate(io);
     return X25519KeyPair{
         .public_key = kp.public_key,
         .secret_key = kp.secret_key,
@@ -76,16 +76,16 @@ pub fn ed25519SecretKeyToX25519(ed_secret: [ed25519_secret_key_len]u8) [x25519_s
     // We need to hash the seed with SHA-512 and take the first 32 bytes (clamped)
     var hash: [64]u8 = undefined;
     std.crypto.hash.sha2.Sha512.hash(ed_secret[0..32], &hash, .{});
-    
+
     // Clamp the scalar (same clamping as X25519)
     var x25519_secret: [32]u8 = hash[0..32].*;
     x25519_secret[0] &= 248;
     x25519_secret[31] &= 127;
     x25519_secret[31] |= 64;
-    
+
     // Wipe the hash
     memory.secureZero(&hash);
-    
+
     return x25519_secret;
 }
 
@@ -118,9 +118,9 @@ pub fn decodeBase64(input: []const u8, output: []u8) ![]u8 {
 
 // Tests
 test "generate ed25519 keypair" {
-    var kp = generateEd25519KeyPair();
+    var kp = generateEd25519KeyPair(std.testing.io);
     defer kp.wipe();
-    
+
     // Public key should not be all zeros
     var all_zero = true;
     for (kp.public_key) |b| {
@@ -133,9 +133,9 @@ test "generate ed25519 keypair" {
 }
 
 test "generate x25519 keypair" {
-    var kp = generateX25519KeyPair();
+    var kp = generateX25519KeyPair(std.testing.io);
     defer kp.wipe();
-    
+
     var all_zero = true;
     for (kp.public_key) |b| {
         if (b != 0) {
@@ -147,13 +147,13 @@ test "generate x25519 keypair" {
 }
 
 test "ed25519 to x25519 conversion" {
-    var ed_kp = generateEd25519KeyPair();
+    var ed_kp = generateEd25519KeyPair(std.testing.io);
     defer ed_kp.wipe();
-    
+
     const x_public = try ed25519PublicKeyToX25519(ed_kp.public_key);
     var x_secret = ed25519SecretKeyToX25519(ed_kp.secret_key);
     defer memory.secureZero(&x_secret);
-    
+
     // Verify that the derived X25519 keypair is valid by computing the public key
     const expected_public = X25519.recoverPublicKey(x_secret) catch unreachable;
     try std.testing.expectEqualSlices(u8, &expected_public, &x_public);
@@ -161,15 +161,15 @@ test "ed25519 to x25519 conversion" {
 
 test "x25519 key agreement" {
     // Generate two keypairs
-    var kp1 = generateX25519KeyPair();
+    var kp1 = generateX25519KeyPair(std.testing.io);
     defer kp1.wipe();
-    var kp2 = generateX25519KeyPair();
+    var kp2 = generateX25519KeyPair(std.testing.io);
     defer kp2.wipe();
-    
+
     // Both parties should derive the same shared secret
     const shared1 = try x25519KeyAgreement(kp1.secret_key, kp2.public_key);
     const shared2 = try x25519KeyAgreement(kp2.secret_key, kp1.public_key);
-    
+
     try std.testing.expectEqualSlices(u8, &shared1, &shared2);
 }
 
@@ -177,9 +177,9 @@ test "base64 round trip" {
     const original = "Hello, World!";
     var encoded: [256]u8 = undefined;
     var decoded: [256]u8 = undefined;
-    
+
     const enc_slice = encodeBase64(original, &encoded);
     const dec_slice = try decodeBase64(enc_slice, &decoded);
-    
+
     try std.testing.expectEqualSlices(u8, original, dec_slice);
 }

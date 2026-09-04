@@ -80,6 +80,7 @@ pub const key_len = 32;
 
 /// Derive a key from a password using Argon2id
 pub fn deriveKey(
+    io: std.Io,
     allocator: std.mem.Allocator,
     password: []const u8,
     salt: [salt_len]u8,
@@ -98,6 +99,7 @@ pub fn deriveKey(
             .p = params.parallelism,
         },
         .argon2id,
+        io,
     ) catch |err| {
         memory.secureZero(&key);
         return switch (err) {
@@ -110,9 +112,9 @@ pub fn deriveKey(
 }
 
 /// Generate a random salt
-pub fn generateSalt() [salt_len]u8 {
+pub fn generateSalt(io: std.Io) [salt_len]u8 {
     var salt: [salt_len]u8 = undefined;
-    std.crypto.random.bytes(&salt);
+    io.random(&salt);
     return salt;
 }
 
@@ -120,7 +122,7 @@ pub fn generateSalt() [salt_len]u8 {
 test "derive key basic" {
     const allocator = std.testing.allocator;
     const password = "test_password_123";
-    const salt = generateSalt();
+    const salt = generateSalt(std.testing.io);
 
     // Use smaller params for test speed
     const test_params = KdfParams{
@@ -129,7 +131,7 @@ test "derive key basic" {
         .parallelism = 1,
     };
 
-    var key = try deriveKey(allocator, password, salt, test_params);
+    var key = try deriveKey(std.testing.io, allocator, password, salt, test_params);
     defer memory.secureZero(&key);
 
     // Key should not be all zeros
@@ -155,9 +157,9 @@ test "derive key deterministic" {
         .parallelism = 1,
     };
 
-    var key1 = try deriveKey(allocator, password, salt, test_params);
+    var key1 = try deriveKey(std.testing.io, allocator, password, salt, test_params);
     defer memory.secureZero(&key1);
-    var key2 = try deriveKey(allocator, password, salt, test_params);
+    var key2 = try deriveKey(std.testing.io, allocator, password, salt, test_params);
     defer memory.secureZero(&key2);
 
     try std.testing.expectEqualSlices(u8, &key1, &key2);

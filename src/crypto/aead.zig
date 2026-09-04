@@ -17,9 +17,9 @@ pub const nonce_len = XChaCha20Poly1305.nonce_length;
 pub const tag_len = XChaCha20Poly1305.tag_length;
 
 /// Generate a random nonce (safe for XChaCha20 due to 24-byte size)
-pub fn generateNonce() [nonce_len]u8 {
+pub fn generateNonce(io: std.Io) [nonce_len]u8 {
     var nonce: [nonce_len]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    io.random(&nonce);
     return nonce;
 }
 
@@ -89,10 +89,10 @@ test "encrypt decrypt round trip" {
     const associated_data = "header data";
 
     var key: [key_len]u8 = undefined;
-    std.crypto.random.bytes(&key);
+    std.testing.io.random(&key);
     defer memory.secureZero(&key);
 
-    const nonce = generateNonce();
+    const nonce = generateNonce(std.testing.io);
 
     var ciphertext: [plaintext.len]u8 = undefined;
     const tag = encrypt(plaintext, associated_data, nonce, key, &ciphertext);
@@ -109,12 +109,12 @@ test "decrypt fails with wrong key" {
 
     var key1: [key_len]u8 = undefined;
     var key2: [key_len]u8 = undefined;
-    std.crypto.random.bytes(&key1);
-    std.crypto.random.bytes(&key2);
+    std.testing.io.random(&key1);
+    std.testing.io.random(&key2);
     defer memory.secureZero(&key1);
     defer memory.secureZero(&key2);
 
-    const nonce = generateNonce();
+    const nonce = generateNonce(std.testing.io);
 
     var ciphertext: [plaintext.len]u8 = undefined;
     const tag = encrypt(plaintext, associated_data, nonce, key1, &ciphertext);
@@ -130,10 +130,10 @@ test "decrypt fails with tampered ciphertext" {
     const associated_data = "";
 
     var key: [key_len]u8 = undefined;
-    std.crypto.random.bytes(&key);
+    std.testing.io.random(&key);
     defer memory.secureZero(&key);
 
-    const nonce = generateNonce();
+    const nonce = generateNonce(std.testing.io);
 
     var ciphertext: [plaintext.len]u8 = undefined;
     const tag = encrypt(plaintext, associated_data, nonce, key, &ciphertext);
@@ -151,10 +151,10 @@ test "decrypt fails with wrong associated data" {
     const plaintext = "Secret message";
 
     var key: [key_len]u8 = undefined;
-    std.crypto.random.bytes(&key);
+    std.testing.io.random(&key);
     defer memory.secureZero(&key);
 
-    const nonce = generateNonce();
+    const nonce = generateNonce(std.testing.io);
 
     var ciphertext: [plaintext.len]u8 = undefined;
     const tag = encrypt(plaintext, "correct_header", nonce, key, &ciphertext);

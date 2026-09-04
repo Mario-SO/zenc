@@ -28,13 +28,14 @@ pub const encrypted_extension = ".zenc";
 pub const hash_len = std.crypto.hash.sha2.Sha256.digest_length;
 
 /// Generate a new keypair for encryption
-pub fn generateKeyPair() keys.Ed25519KeyPair {
-    return keys.generateEd25519KeyPair();
+pub fn generateKeyPair(io: std.Io) keys.Ed25519KeyPair {
+    return keys.generateEd25519KeyPair(io);
 }
 
 /// Encrypt a file with a password
 /// Returns the SHA-256 hash of the original plaintext
 pub fn encryptFileWithPassword(
+    io: std.Io,
     allocator: std.mem.Allocator,
     input_path: []const u8,
     output_path: []const u8,
@@ -43,21 +44,27 @@ pub fn encryptFileWithPassword(
     progress_callback: ?stream.ProgressCallback,
 ) ![hash_len]u8 {
     // Open input file
-    const input_file = try std.fs.cwd().openFile(input_path, .{});
-    defer input_file.close();
+    const input_file = try std.Io.Dir.cwd().openFile(io, input_path, .{});
+    defer input_file.close(io);
 
-    const file_size = try input_file.getEndPos();
+    const file_size = try input_file.length(io);
 
     // Open output file
-    const output_file = try std.fs.cwd().createFile(output_path, .{});
-    defer output_file.close();
+    const output_file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
+    defer output_file.close(io);
+
+    var input_buffer: [4096]u8 = undefined;
+    var input_reader = input_file.reader(io, &input_buffer);
+    var output_buffer: [4096]u8 = undefined;
+    var output_writer = output_file.writer(io, &output_buffer);
+    defer output_writer.interface.flush() catch {};
 
     // Generate salt and nonce
-    const salt = kdf.generateSalt();
-    const nonce = aead.generateNonce();
+    const salt = kdf.generateSalt(io);
+    const nonce = aead.generateNonce(io);
 
     // Derive key from password
-    var key = try kdf.deriveKey(allocator, password, salt, kdf_params);
+    var key = try kdf.deriveKey(io, allocator, password, salt, kdf_params);
     defer memory.secureZero(&key);
 
     // Write header directly
@@ -68,13 +75,13 @@ pub fn encryptFileWithPassword(
         .nonce = nonce,
     };
     const header_bytes = file_header.serialize();
-    try output_file.writeAll(&header_bytes);
+    try output_writer.interface.writeAll(&header_bytes);
 
     // Encrypt file content with header bound as associated data
     // Returns hash of the original plaintext
     return try stream.encryptStream(
-        input_file,
-        output_file,
+        &input_reader.interface,
+        &output_writer.interface,
         key,
         nonce,
         file_size,
@@ -86,6 +93,7 @@ pub fn encryptFileWithPassword(
 /// Encrypt a file with a public key
 /// Returns the SHA-256 hash of the original plaintext
 pub fn encryptFileWithPubkey(
+    io: std.Io,
     allocator: std.mem.Allocator,
     input_path: []const u8,
     output_path: []const u8,
@@ -94,20 +102,26 @@ pub fn encryptFileWithPubkey(
     progress_callback: ?stream.ProgressCallback,
 ) ![hash_len]u8 {
     // Open input file
-    const input_file = try std.fs.cwd().openFile(input_path, .{});
-    defer input_file.close();
+    const input_file = try std.Io.Dir.cwd().openFile(io, input_path, .{});
+    defer input_file.close(io);
 
-    const file_size = try input_file.getEndPos();
+    const file_size = try input_file.length(io);
 
     // Open output file
-    const output_file = try std.fs.cwd().createFile(output_path, .{});
-    defer output_file.close();
+    const output_file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
+    defer output_file.close(io);
+
+    var input_buffer: [4096]u8 = undefined;
+    var input_reader = input_file.reader(io, &input_buffer);
+    var output_buffer: [4096]u8 = undefined;
+    var output_writer = output_file.writer(io, &output_buffer);
+    defer output_writer.interface.flush() catch {};
 
     // Convert recipient's Ed25519 public key to X25519
     const recipient_x25519 = try keys.ed25519PublicKeyToX25519(recipient_pubkey);
 
     // Generate ephemeral X25519 keypair
-    var ephemeral = keys.generateX25519KeyPair();
+    var ephemeral = keys.generateX25519KeyPair(io);
     defer ephemeral.wipe();
 
     // Perform key agreement
@@ -115,7 +129,7 @@ pub fn encryptFileWithPubkey(
     defer memory.secureZero(&shared_secret);
 
     // Generate salt and derive key from shared secret
-    const salt = kdf.generateSalt();
+    const salt = kdf.generateSalt(io);
 
     // Use a simpler KDF for pubkey mode (shared secret is already high-entropy)
     const pubkey_kdf_params = kdf.KdfParams{
@@ -123,10 +137,10 @@ pub fn encryptFileWithPubkey(
         .iterations = 1,
         .parallelism = 1,
     };
-    var key = try kdf.deriveKey(allocator, &shared_secret, salt, pubkey_kdf_params);
+    var key = try kdf.deriveKey(io, allocator, &shared_secret, salt, pubkey_kdf_params);
     defer memory.secureZero(&key);
 
-    const nonce = aead.generateNonce();
+    const nonce = aead.generateNonce(io);
 
     // Write header directly
     const file_header = header.PubkeyHeader{
@@ -137,13 +151,13 @@ pub fn encryptFileWithPubkey(
         .nonce = nonce,
     };
     const header_bytes = file_header.serialize();
-    try output_file.writeAll(&header_bytes);
+    try output_writer.interface.writeAll(&header_bytes);
 
     // Encrypt file content with header bound as associated data
     // Returns hash of the original plaintext
     return try stream.encryptStream(
-        input_file,
-        output_file,
+        &input_reader.interface,
+        &output_writer.interface,
         key,
         nonce,
         file_size,
@@ -155,6 +169,7 @@ pub fn encryptFileWithPubkey(
 /// Decrypt a file (auto-detects mode from header)
 /// Returns the SHA-256 hash of the decrypted plaintext
 pub fn decryptFile(
+    io: std.Io,
     allocator: std.mem.Allocator,
     input_path: []const u8,
     output_path: []const u8,
@@ -163,14 +178,14 @@ pub fn decryptFile(
     progress_callback: ?stream.ProgressCallback,
 ) ![hash_len]u8 {
     // Open input file
-    const input_file = try std.fs.cwd().openFile(input_path, .{});
-    defer input_file.close();
+    const input_file = try std.Io.Dir.cwd().openFile(io, input_path, .{});
+    defer input_file.close(io);
 
-    const file_size = try input_file.getEndPos();
+    const file_size = try input_file.length(io);
 
     // Read mode from header - read directly into buffer
     var mode_buf: [6]u8 = undefined;
-    const bytes_read = try input_file.readAll(&mode_buf);
+    const bytes_read = try input_file.readPositionalAll(io, &mode_buf, 0);
     if (bytes_read < 6) {
         return error.UnexpectedEof;
     }
@@ -186,35 +201,39 @@ pub fn decryptFile(
     }
 
     // Get mode
-    const mode = std.meta.intToEnum(header.Mode, mode_buf[5]) catch return error.InvalidMode;
-
-    // Seek back to start
-    try input_file.seekTo(0);
+    const mode = std.enums.fromInt(header.Mode, mode_buf[5]) orelse return error.InvalidMode;
 
     // Open output file
-    const output_file = try std.fs.cwd().createFile(output_path, .{});
-    defer output_file.close();
+    const output_file = try std.Io.Dir.cwd().createFile(io, output_path, .{});
+    defer output_file.close(io);
+
+    var input_buffer: [4096]u8 = undefined;
+    var input_reader = input_file.reader(io, &input_buffer);
+    var output_buffer: [4096]u8 = undefined;
+    var output_writer = output_file.writer(io, &output_buffer);
+    defer output_writer.interface.flush() catch {};
 
     return switch (mode) {
         .password => {
             if (password == null) {
                 return error.PasswordRequired;
             }
-            return try decryptPasswordFile(allocator, input_file, output_file, file_size, password.?, progress_callback);
+            return try decryptPasswordFile(io, allocator, &input_reader.interface, &output_writer.interface, file_size, password.?, progress_callback);
         },
         .pubkey => {
             if (secret_key == null) {
                 return error.SecretKeyRequired;
             }
-            return try decryptPubkeyFile(allocator, input_file, output_file, file_size, secret_key.?, progress_callback);
+            return try decryptPubkeyFile(io, allocator, &input_reader.interface, &output_writer.interface, file_size, secret_key.?, progress_callback);
         },
     };
 }
 
 fn decryptPasswordFile(
+    io: std.Io,
     allocator: std.mem.Allocator,
-    input_file: std.fs.File,
-    output_file: std.fs.File,
+    input: *std.Io.Reader,
+    output: *std.Io.Writer,
     file_size: u64,
     password: []const u8,
     progress_callback: ?stream.ProgressCallback,
@@ -226,17 +245,14 @@ fn decryptPasswordFile(
 
     // Read header directly
     var header_bytes: [header.PasswordHeader.size]u8 = undefined;
-    const bytes_read = try input_file.readAll(&header_bytes);
-    if (bytes_read < header.PasswordHeader.size) {
-        return error.UnexpectedEof;
-    }
+    input.readSliceAll(&header_bytes) catch return error.UnexpectedEof;
     const file_header = try header.PasswordHeader.deserialize(header_bytes);
 
     // Validate KDF parameters from header to prevent DoS
     try kdf.validateParams(file_header.kdf_params);
 
     // Derive key
-    var key = try kdf.deriveKey(allocator, password, file_header.salt, file_header.kdf_params);
+    var key = try kdf.deriveKey(io, allocator, password, file_header.salt, file_header.kdf_params);
     defer memory.secureZero(&key);
 
     // Calculate encrypted payload size
@@ -244,8 +260,8 @@ fn decryptPasswordFile(
 
     // Decrypt with header bound as associated data
     return try stream.decryptStream(
-        input_file,
-        output_file,
+        input,
+        output,
         key,
         file_header.nonce,
         encrypted_size,
@@ -255,9 +271,10 @@ fn decryptPasswordFile(
 }
 
 fn decryptPubkeyFile(
+    io: std.Io,
     allocator: std.mem.Allocator,
-    input_file: std.fs.File,
-    output_file: std.fs.File,
+    input: *std.Io.Reader,
+    output: *std.Io.Writer,
     file_size: u64,
     secret_key: [keys.ed25519_secret_key_len]u8,
     progress_callback: ?stream.ProgressCallback,
@@ -269,10 +286,7 @@ fn decryptPubkeyFile(
 
     // Read header directly
     var header_bytes: [header.PubkeyHeader.size]u8 = undefined;
-    const bytes_read = try input_file.readAll(&header_bytes);
-    if (bytes_read < header.PubkeyHeader.size) {
-        return error.UnexpectedEof;
-    }
+    input.readSliceAll(&header_bytes) catch return error.UnexpectedEof;
     const file_header = try header.PubkeyHeader.deserialize(header_bytes);
 
     // Validate KDF parameters from header to prevent DoS
@@ -287,7 +301,7 @@ fn decryptPubkeyFile(
     defer memory.secureZero(&shared_secret);
 
     // Derive key
-    var key = try kdf.deriveKey(allocator, &shared_secret, file_header.salt, file_header.kdf_params);
+    var key = try kdf.deriveKey(io, allocator, &shared_secret, file_header.salt, file_header.kdf_params);
     defer memory.secureZero(&key);
 
     // Calculate encrypted payload size
@@ -295,8 +309,8 @@ fn decryptPubkeyFile(
 
     // Decrypt with header bound as associated data
     return try stream.decryptStream(
-        input_file,
-        output_file,
+        input,
+        output,
         key,
         file_header.nonce,
         encrypted_size,
@@ -322,21 +336,21 @@ const testing = std.testing;
 
 fn createTestFile(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !void {
     _ = allocator;
-    const file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(content);
+    const file = try std.Io.Dir.cwd().createFile(testing.io, path, .{});
+    defer file.close(testing.io);
+    try file.writeStreamingAll(testing.io, content);
 }
 
 fn deleteTestFile(path: []const u8) void {
-    std.fs.cwd().deleteFile(path) catch {};
+    std.Io.Dir.cwd().deleteFile(testing.io, path) catch {};
 }
 
 fn readFileContent(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const size = try file.getEndPos();
+    const file = try std.Io.Dir.cwd().openFile(testing.io, path, .{});
+    defer file.close(testing.io);
+    const size = try file.length(testing.io);
     const content = try allocator.alloc(u8, size);
-    _ = try file.readAll(content);
+    _ = try file.readPositionalAll(testing.io, content, 0);
     return content;
 }
 
@@ -360,6 +374,7 @@ test "encrypt decrypt roundtrip with password" {
 
     // Encrypt
     const encrypt_hash = try encryptFileWithPassword(
+        testing.io,
         allocator,
         "test_input.txt",
         "test_input.txt.zenc",
@@ -370,6 +385,7 @@ test "encrypt decrypt roundtrip with password" {
 
     // Decrypt
     const decrypt_hash = try decryptFile(
+        testing.io,
         allocator,
         "test_input.txt.zenc",
         "test_output.txt",
@@ -405,6 +421,7 @@ test "header tampering causes decryption failure" {
     };
 
     _ = try encryptFileWithPassword(
+        testing.io,
         allocator,
         "tamper_test.txt",
         "tamper_test.txt.zenc",
@@ -423,13 +440,14 @@ test "header tampering causes decryption failure" {
 
     // Write tampered file
     {
-        const tampered_file = try std.fs.cwd().createFile("tamper_test.txt.zenc", .{});
-        defer tampered_file.close();
-        try tampered_file.writeAll(encrypted);
+        const tampered_file = try std.Io.Dir.cwd().createFile(testing.io, "tamper_test.txt.zenc", .{});
+        defer tampered_file.close(testing.io);
+        try tampered_file.writeStreamingAll(testing.io, encrypted);
     }
 
     // Decrypt should fail - either authentication or some other error
     if (decryptFile(
+        testing.io,
         allocator,
         "tamper_test.txt.zenc",
         "tamper_output.txt",
@@ -461,6 +479,7 @@ test "ciphertext tampering causes authentication failure" {
     };
 
     _ = try encryptFileWithPassword(
+        testing.io,
         allocator,
         "ct_tamper.txt",
         "ct_tamper.txt.zenc",
@@ -479,12 +498,13 @@ test "ciphertext tampering causes authentication failure" {
         encrypted[ciphertext_offset] ^= 0xFF;
     }
 
-    const tampered_file = try std.fs.cwd().createFile("ct_tamper.txt.zenc", .{});
-    defer tampered_file.close();
-    try tampered_file.writeAll(encrypted);
+    const tampered_file = try std.Io.Dir.cwd().createFile(testing.io, "ct_tamper.txt.zenc", .{});
+    defer tampered_file.close(testing.io);
+    try tampered_file.writeStreamingAll(testing.io, encrypted);
 
     // Decrypt should fail
     const result = decryptFile(
+        testing.io,
         allocator,
         "ct_tamper.txt.zenc",
         "ct_tamper_out.txt",
@@ -512,6 +532,7 @@ test "truncated file causes error" {
     };
 
     _ = try encryptFileWithPassword(
+        testing.io,
         allocator,
         "truncate.txt",
         "truncate.txt.zenc",
@@ -528,13 +549,14 @@ test "truncated file causes error" {
     const truncated_size = header.PasswordHeader.size + 10;
     if (encrypted.len > truncated_size) {
         {
-            const truncated_file = try std.fs.cwd().createFile("truncate.txt.zenc", .{});
-            defer truncated_file.close();
-            try truncated_file.writeAll(encrypted[0..truncated_size]);
+            const truncated_file = try std.Io.Dir.cwd().createFile(testing.io, "truncate.txt.zenc", .{});
+            defer truncated_file.close(testing.io);
+            try truncated_file.writeStreamingAll(testing.io, encrypted[0..truncated_size]);
         }
 
         // Decrypt should fail with some error
         if (decryptFile(
+            testing.io,
             allocator,
             "truncate.txt.zenc",
             "truncate_out.txt",
@@ -568,6 +590,7 @@ test "wrong password causes authentication failure" {
     };
 
     _ = try encryptFileWithPassword(
+        testing.io,
         allocator,
         "wrong_pwd.txt",
         "wrong_pwd.txt.zenc",
@@ -578,6 +601,7 @@ test "wrong password causes authentication failure" {
 
     // Try to decrypt with wrong password
     const result = decryptFile(
+        testing.io,
         allocator,
         "wrong_pwd.txt.zenc",
         "wrong_pwd_out.txt",
@@ -597,6 +621,7 @@ test "file too small for header rejected" {
     defer deleteTestFile("small_out.txt");
 
     const result = decryptFile(
+        testing.io,
         allocator,
         "small.zenc",
         "small_out.txt",

@@ -25,7 +25,7 @@ All cryptography uses Zig's standard library (`std.crypto`), which wraps audited
 
 ## Building
 
-Requires Zig 0.15.2 or later.
+Requires Zig 0.16.0 or later.
 
 ```bash
 # Build
@@ -155,30 +155,38 @@ zenc can be used as a Zig library:
 
 ```zig
 const zenc = @import("zenc");
+const std = @import("std");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
 // Generate keypair
-var kp = zenc.generateKeyPair();
-defer kp.wipe();
+    var kp = zenc.generateKeyPair(io);
+    defer kp.wipe();
 
 // Encrypt with password
-try zenc.encryptFileWithPassword(
-    allocator,
-    "input.txt",
-    "input.txt.zenc",
-    "password123",
-    zenc.kdf.default_params,
-    null, // progress callback
-);
+    _ = try zenc.encryptFileWithPassword(
+        io,
+        allocator,
+        "input.txt",
+        "input.txt.zenc",
+        "password123",
+        zenc.kdf.default_params,
+        null, // progress callback
+    );
 
 // Decrypt
-try zenc.decryptFile(
-    allocator,
-    "input.txt.zenc",
-    "output.txt",
-    "password123",
-    null, // or secret_key for pubkey mode
-    null, // progress callback
-);
+    _ = try zenc.decryptFile(
+        io,
+        allocator,
+        "input.txt.zenc",
+        "output.txt",
+        "password123",
+        null, // or secret_key for pubkey mode
+        null, // progress callback
+    );
+}
 ```
 
 ## License

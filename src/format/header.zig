@@ -224,10 +224,10 @@ pub const PubkeyHeader = struct {
 /// Read just the mode from a file header (to determine which header type to use)
 pub fn readMode(reader: anytype) !Mode {
     var header_start: [6]u8 = undefined;
-    const bytes_read = try reader.readAll(&header_start);
-    if (bytes_read < 6) {
-        return error.UnexpectedEof;
-    }
+    reader.readSliceAll(&header_start) catch |err| switch (err) {
+        error.EndOfStream => return error.UnexpectedEof,
+        else => return err,
+    };
 
     // Validate magic
     if (!std.mem.eql(u8, header_start[0..4], &magic)) {
@@ -240,26 +240,26 @@ pub fn readMode(reader: anytype) !Mode {
     }
 
     // Return mode
-    return std.meta.intToEnum(Mode, header_start[5]) catch error.InvalidMode;
+    return std.enums.fromInt(Mode, header_start[5]) orelse error.InvalidMode;
 }
 
 /// Read password header from reader
 pub fn readPasswordHeader(reader: anytype) !PasswordHeader {
     var bytes: [PasswordHeader.size]u8 = undefined;
-    const bytes_read = try reader.readAll(&bytes);
-    if (bytes_read < PasswordHeader.size) {
-        return error.UnexpectedEof;
-    }
+    reader.readSliceAll(&bytes) catch |err| switch (err) {
+        error.EndOfStream => return error.UnexpectedEof,
+        else => return err,
+    };
     return PasswordHeader.deserialize(bytes);
 }
 
 /// Read pubkey header from reader
 pub fn readPubkeyHeader(reader: anytype) !PubkeyHeader {
     var bytes: [PubkeyHeader.size]u8 = undefined;
-    const bytes_read = try reader.readAll(&bytes);
-    if (bytes_read < PubkeyHeader.size) {
-        return error.UnexpectedEof;
-    }
+    reader.readSliceAll(&bytes) catch |err| switch (err) {
+        error.EndOfStream => return error.UnexpectedEof,
+        else => return err,
+    };
     return PubkeyHeader.deserialize(bytes);
 }
 

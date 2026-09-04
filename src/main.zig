@@ -22,13 +22,11 @@ const json = zenc.json;
 var g_total_size: u64 = 0;
 var g_last_progress_percent: u64 = 0;
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    json.init(io);
 
     if (args.len < 2) {
         try emitUsageError();
@@ -38,11 +36,11 @@ pub fn main() !void {
     const command = args[1];
 
     if (std.mem.eql(u8, command, "keygen")) {
-        try cmdKeygen();
+        try cmdKeygen(io);
     } else if (std.mem.eql(u8, command, "encrypt")) {
-        try cmdEncrypt(allocator, args[2..]);
+        try cmdEncrypt(io, allocator, args[2..]);
     } else if (std.mem.eql(u8, command, "decrypt")) {
-        try cmdDecrypt(allocator, args[2..]);
+        try cmdDecrypt(io, allocator, args[2..]);
     } else {
         try json.emitError("unknown_command", "Unknown command. Use: keygen, encrypt, decrypt");
         std.process.exit(1);
@@ -54,8 +52,8 @@ fn emitUsageError() !void {
 }
 
 /// Generate a new keypair
-fn cmdKeygen() !void {
-    var kp = keys.generateEd25519KeyPair();
+fn cmdKeygen(io: std.Io) !void {
+    var kp = keys.generateEd25519KeyPair(io);
     defer kp.wipe();
 
     // Encode keys to base64
@@ -89,11 +87,13 @@ const StdinResult = struct {
 /// Read a line from stdin, trimming trailing newlines.
 /// Returns error if input is empty (after trimming) or exceeds max_stdin_size.
 /// Caller must call wipe() on result when done.
-fn readStdinLine(buffer: *[max_stdin_size]u8, require_non_empty: bool) !StdinResult {
-    const stdin = std.fs.File.stdin();
+fn readStdinLine(io: std.Io, buffer: *[max_stdin_size]u8, require_non_empty: bool) !StdinResult {
+    const stdin = std.Io.File.stdin();
+    var reader_buffer: [256]u8 = undefined;
+    var stdin_reader = stdin.readerStreaming(io, &reader_buffer);
 
     // Read from stdin
-    const bytes_read = stdin.read(buffer) catch |err| {
+    const bytes_read = stdin_reader.interface.readSliceShort(buffer) catch |err| {
         try json.emitError("stdin_error", @errorName(err));
         std.process.exit(1);
     };
@@ -102,7 +102,7 @@ fn readStdinLine(buffer: *[max_stdin_size]u8, require_non_empty: bool) !StdinRes
     if (bytes_read == max_stdin_size) {
         // Try to read one more byte to detect overflow
         var overflow_check: [1]u8 = undefined;
-        const extra = stdin.read(&overflow_check) catch 0;
+        const extra = stdin_reader.interface.readSliceShort(&overflow_check) catch 0;
         if (extra > 0) {
             try json.emitError("input_too_long", "Input exceeds maximum allowed size");
             std.process.exit(1);
@@ -128,7 +128,7 @@ fn readStdinLine(buffer: *[max_stdin_size]u8, require_non_empty: bool) !StdinRes
 }
 
 /// Encrypt a file
-fn cmdEncrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdEncrypt(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         try json.emitError("missing_file", "Usage: zenc encrypt <file> [--password | --to <pubkey>]");
         std.process.exit(1);
@@ -159,15 +159,15 @@ fn cmdEncrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Get file size
-    const input_file = std.fs.cwd().openFile(input_path, .{}) catch |err| {
+    const input_file = std.Io.Dir.cwd().openFile(io, input_path, .{}) catch |err| {
         try json.emitError("file_error", @errorName(err));
         std.process.exit(1);
     };
-    const file_size = input_file.getEndPos() catch |err| {
+    const file_size = input_file.length(io) catch |err| {
         try json.emitError("file_error", @errorName(err));
         std.process.exit(1);
     };
-    input_file.close();
+    input_file.close(io);
 
     // Generate output path
     const output_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ input_path, zenc.encrypted_extension });
@@ -185,10 +185,11 @@ fn cmdEncrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (password_mode) {
         // Read password from stdin (require non-empty)
         var password_buf: [max_stdin_size]u8 = undefined;
-        var stdin_result = try readStdinLine(&password_buf, true);
+        var stdin_result = try readStdinLine(io, &password_buf, true);
         defer stdin_result.wipe();
 
         hash = zenc.encryptFileWithPassword(
+            io,
             allocator,
             input_path,
             output_path,
@@ -208,6 +209,7 @@ fn cmdEncrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
         };
 
         hash = zenc.encryptFileWithPubkey(
+            io,
             allocator,
             input_path,
             output_path,
@@ -226,7 +228,7 @@ fn cmdEncrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 /// Decrypt a file
-fn cmdDecrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdDecrypt(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         try json.emitError("missing_file", "Usage: zenc decrypt <file>");
         std.process.exit(1);
@@ -245,18 +247,18 @@ fn cmdDecrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer allocator.free(output_path);
 
     // Open file to check mode
-    const input_file = std.fs.cwd().openFile(input_path, .{}) catch |err| {
+    const input_file = std.Io.Dir.cwd().openFile(io, input_path, .{}) catch |err| {
         try json.emitError("file_error", @errorName(err));
         std.process.exit(1);
     };
-    const file_size = input_file.getEndPos() catch |err| {
+    const file_size = input_file.length(io) catch |err| {
         try json.emitError("file_error", @errorName(err));
         std.process.exit(1);
     };
 
     // Read mode from header directly
     var mode_buf: [6]u8 = undefined;
-    _ = input_file.readAll(&mode_buf) catch |err| {
+    _ = input_file.readPositionalAll(io, &mode_buf, 0) catch |err| {
         try json.emitError("header_error", @errorName(err));
         std.process.exit(1);
     };
@@ -274,11 +276,11 @@ fn cmdDecrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Get mode
-    const mode = std.meta.intToEnum(header.Mode, mode_buf[5]) catch {
+    const mode = std.enums.fromInt(header.Mode, mode_buf[5]) orelse {
         try json.emitError("header_error", "InvalidMode");
         std.process.exit(1);
     };
-    input_file.close();
+    input_file.close(io);
 
     try json.emitStart(input_path, file_size);
 
@@ -292,10 +294,10 @@ fn cmdDecrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .password => {
             // Read password from stdin (require non-empty for consistency with encrypt)
             var password_buf: [max_stdin_size]u8 = undefined;
-            var stdin_result = try readStdinLine(&password_buf, true);
+            var stdin_result = try readStdinLine(io, &password_buf, true);
             defer stdin_result.wipe();
 
-            hash = zenc.decryptFile(allocator, input_path, output_path, stdin_result.data, null, progressCallback) catch |err| {
+            hash = zenc.decryptFile(io, allocator, input_path, output_path, stdin_result.data, null, progressCallback) catch |err| {
                 try json.emitError("decrypt_error", @errorName(err));
                 std.process.exit(1);
             };
@@ -303,7 +305,7 @@ fn cmdDecrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .pubkey => {
             // Read secret key from stdin (base64 encoded, require non-empty)
             var key_buf: [max_stdin_size]u8 = undefined;
-            var stdin_result = try readStdinLine(&key_buf, true);
+            var stdin_result = try readStdinLine(io, &key_buf, true);
             defer stdin_result.wipe();
 
             // Decode secret key
@@ -314,7 +316,7 @@ fn cmdDecrypt(allocator: std.mem.Allocator, args: []const []const u8) !void {
             };
             defer memory.secureZero(&secret_key);
 
-            hash = zenc.decryptFile(allocator, input_path, output_path, null, secret_key, progressCallback) catch |err| {
+            hash = zenc.decryptFile(io, allocator, input_path, output_path, null, secret_key, progressCallback) catch |err| {
                 try json.emitError("decrypt_error", @errorName(err));
                 std.process.exit(1);
             };

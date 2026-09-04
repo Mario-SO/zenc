@@ -24,8 +24,8 @@ pub const ProgressCallback = *const fn (bytes_processed: u64, total_bytes: u64) 
 /// Returns the SHA-256 hash of the original plaintext
 /// header_bytes: serialized header to bind into AEAD associated data for authentication
 pub fn encryptStream(
-    input_file: std.fs.File,
-    output_file: std.fs.File,
+    input: *std.Io.Reader,
+    output: *std.Io.Writer,
     key: [aead.key_len]u8,
     base_nonce: [aead.nonce_len]u8,
     total_size: u64,
@@ -40,7 +40,7 @@ pub fn encryptStream(
     var hasher = Sha256.init(.{});
 
     while (true) {
-        const bytes_read = try input_file.readAll(&plaintext_buf);
+        const bytes_read = try input.readSliceShort(&plaintext_buf);
         if (bytes_read == 0) break;
 
         const plaintext = plaintext_buf[0..bytes_read];
@@ -65,8 +65,8 @@ pub fn encryptStream(
         );
 
         // Write ciphertext followed by tag
-        try output_file.writeAll(ciphertext_buf[0..bytes_read]);
-        try output_file.writeAll(&tag);
+        try output.writeAll(ciphertext_buf[0..bytes_read]);
+        try output.writeAll(&tag);
 
         bytes_processed += bytes_read;
         chunk_index += 1;
@@ -90,8 +90,8 @@ pub fn encryptStream(
 /// Returns the SHA-256 hash of the decrypted plaintext
 /// header_bytes: serialized header to verify AEAD associated data
 pub fn decryptStream(
-    input_file: std.fs.File,
-    output_file: std.fs.File,
+    input: *std.Io.Reader,
+    output: *std.Io.Writer,
     key: [aead.key_len]u8,
     base_nonce: [aead.nonce_len]u8,
     encrypted_size: u64,
@@ -130,16 +130,16 @@ pub fn decryptStream(
             default_chunk_size;
 
         // Read ciphertext
-        const ct_bytes_read = try input_file.readAll(ciphertext_buf[0..ciphertext_size]);
-        if (ct_bytes_read < ciphertext_size) {
-            return error.UnexpectedEof;
-        }
+        input.readSliceAll(ciphertext_buf[0..ciphertext_size]) catch |err| switch (err) {
+            error.EndOfStream => return error.UnexpectedEof,
+            else => return err,
+        };
 
         // Read tag
-        const tag_bytes_read = try input_file.readAll(&tag_buf);
-        if (tag_bytes_read < aead.tag_len) {
-            return error.UnexpectedEof;
-        }
+        input.readSliceAll(&tag_buf) catch |err| switch (err) {
+            error.EndOfStream => return error.UnexpectedEof,
+            else => return err,
+        };
 
         // Derive chunk nonce
         const chunk_nonce = deriveChunkNonce(base_nonce, chunk_index);
@@ -164,7 +164,7 @@ pub fn decryptStream(
         hasher.update(plaintext_buf[0..ciphertext_size]);
 
         // Write plaintext
-        try output_file.writeAll(plaintext_buf[0..ciphertext_size]);
+        try output.writeAll(plaintext_buf[0..ciphertext_size]);
 
         bytes_processed += ciphertext_size + aead.tag_len;
         chunk_index += 1;
